@@ -21,20 +21,9 @@ const logger = winston.createLogger({
 const Entities = require('html-entities').XmlEntities;
 const entities = new Entities();
 
-
-class SetupPuppterError extends Error {  
-    constructor (message) {
-      super(message)
-  
-      this.name = this.constructor.name
-    }
-}
-  
-
 async function run (keywordFile) {
     try{
         puppeteer.use(StealthPlugin())
-        // console.log("Keyword files: ",keywordFile);
         logger.info(`Keyword files: ${keywordFile}`);
         let browser = null
         let page = null
@@ -65,7 +54,7 @@ async function run (keywordFile) {
                 try {
                     await setup()
                 }catch(err){
-                    throw new SetupPuppterError(err)
+                    throw err
                 }
                 continue
             }
@@ -86,10 +75,20 @@ async function processPage(page,keyword, currentIndex){
         timeout: 30000,
         waitUntil: 'networkidle2',
     });
-  
+    
+    childLogger.info(`Status code: ${response._status}`);
     let fileName = `${keyword}_${currentIndex}_${response._status}`
-    await page.waitFor(3000);
+    // await page.waitFor(3000);
+    try{
+        if (await isRecaptchaPage(page)){
+            fileName = `${keyword}_${currentIndex}_${response._status}_RECAPTCHA`
+        }
+    }catch(err){
+        throw err
+    }
+
     let html = await page.content();
+    
     let content = entities.decode(html);
     fs.writeFile(`html/${fileName}.html`, content, function (err) {
         if (err) throw err;
@@ -103,5 +102,18 @@ async function processPage(page,keyword, currentIndex){
     childLogger.info(`Took ${secondsDiff}s`)
 }
 
+async function isRecaptchaPage(page){
+    const iframe = await page.$("iframe");
+    if (iframe == null){
+        return false
+    }
+    const srcProp = await iframe.getProperty('src');
+    const src = await srcProp.jsonValue();
+    if(src.startsWith("https://www.google.com/recaptcha")){
+      return true
+    } else{
+      return false
+    }
+}
 
 run("/usr/share/dict/words");

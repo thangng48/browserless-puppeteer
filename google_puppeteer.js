@@ -69,7 +69,7 @@ async function run (keywordFile) {
 async function processPage(page,keyword, currentIndex){
     let startTime = moment();
     const childLogger = logger.child({ keyword: keyword, "current-index": currentIndex });
-    let url = "https://www.google.com/search?q=" + keyword
+    let url = "https://www.google.com/search?gl=us&q=" + keyword
     childLogger.info(`Start request to [${url}]`)
     const response = await page.goto(url, {
         timeout: 30000,

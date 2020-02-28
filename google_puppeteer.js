@@ -3,7 +3,9 @@ const winston = require('winston');
 const lineByLine = require('n-readlines');
 const puppeteer = require('puppeteer-extra') 
 const StealthPlugin = require('puppeteer-extra-plugin-stealth')
+puppeteer.use(StealthPlugin())
 var moment = require('moment')
+var sleep = require('sleep');
 
 const logger = winston.createLogger({
     level: 'info',
@@ -20,6 +22,8 @@ const logger = winston.createLogger({
 
 const Entities = require('html-entities').XmlEntities;
 const entities = new Entities();
+const Queue = require('bull');
+const KeywordQueue = new Queue('keyword');
 
 class EncounterRecaptcha extends Error {  
     constructor (message) {
@@ -29,67 +33,109 @@ class EncounterRecaptcha extends Error {
     }
 }
 
+function getKeywordBulk(iterator, size=100) {
+    var bulk = []
+    let line;
+    let index = 0
+    let endOfIterator = true
+    let keyword;
+    while(line = iterator.next()){
+        keyword = line.toString()
+        bulk.push(keyword)
+        index++
+        if(index > size){
+            endOfIterator = false
+            break
+        }
+    }
+    return {bulkKeyword: bulk, endOfIterator: endOfIterator}
+}
+
 async function run (keywordFile) {
-    try{
-        puppeteer.use(StealthPlugin())
-        logger.info(`Keyword files: ${keywordFile}`);
-        let browser = null
-        let page = null
+    let liner = new lineByLine(keywordFile)
+    queueConsumer()
+    queueProducer(liner)
+}
 
-        const cleanup = () =>{
-            if (browser != null && browser.isConnected()){
-                browser.close()
-            } 
-            if (page != null && page.isClosed()){
-                page.close()
-            }
+async function queueProducer(keywordIterator){
+    let line
+    let keyword
+    let keywordIndex = 1
+
+    while(line = keywordIterator.next()){
+        let count = await KeywordQueue.count()
+        if (count > 10){
+            logger.info(`Number of job: ${count}. Sleep 5s.`)
+            await new Promise(resolve => setTimeout(resolve, 5000));
         }
+        keyword = line.toString()
 
-        const setup = async () => {
-            cleanup()
-            browser = await puppeteer.connect({
-                browserWSEndpoint: `ws://localhost:3000`        
-            });
-            page = await browser.newPage();
-        }
-
-        await setup()
-    
-        const liner = new lineByLine(keywordFile);    
-        let line;
-        let current = 1;
-        let keyword;
-        while (line = liner.next()) {
-            keyword = line.toString();
-            try {
-                console.log(await browser.userAgent())
-                await processKeyword(page, keyword, current);
-            } catch(err){   
-                if (err instanceof EncounterRecaptcha){
-                    throw err
-                }
-
-                logger.error(err);
-                try {
-                    await setup()
-                }catch(err){
-                    throw err
-                }
-                continue
-            }
-            current++;
-        }
-        browser.close();
-    }catch(err){
-        throw err
+        KeywordQueue.add({
+            keyword: keyword,
+            index: keywordIndex,
+            pageIndex: 0
+        })
+        keywordIndex++
     }
 }
 
-async function saveEachPage(page, response, keyword, currentIndex, pageIndex, logger, takeScreenshot){
+async function queueConsumer(){
+    let browser = null
+    let page = null
+
+    const cleanup = () =>{
+        if (browser != null && browser.isConnected()){
+            browser.close()
+        } 
+        if (page != null && page.isClosed()){
+            page.close()
+        }
+    }
+
+    const setup = async () => {
+        cleanup()
+        browser = await puppeteer.connect({
+            browserWSEndpoint: `ws://localhost:3000`        
+        });
+        page = await browser.newPage();
+    }
+
+    await setup()
+
+    await KeywordQueue.process(async function(job, done){
+        let {keyword, index, pageIndex} = job.data
+        try{
+            await processKeyword(page, keyword, index, pageIndex)
+            if (pageIndex < 10){
+                await KeywordQueue.add({
+                    keyword: keyword,
+                    index: index,
+                    pageIndex: pageIndex+1
+                })
+            }
+        }catch(err){
+            logger.error(err)
+            await KeywordQueue.add({
+                keyword: keyword,
+                index: index,
+                pageIndex: pageIndex
+            })
+            try{
+                await setup()
+            }catch(err){
+                logger.error(err)
+            }
+        }finally{
+            done();
+        }
+    })
+}
+
+
+async function saveSearchResultPage(page, response, keyword, currentIndex, pageIndex, logger, takeScreenshot){
     let childLogger = logger.child({ pageIndex: pageIndex})
     let fileName = `${keyword}_${pageIndex}_${currentIndex}_${response._status}`
     let isRepcaptcha = false
-    // await page.waitFor(3000);
     try{
         if (await isRecaptchaPage(page)){
             childLogger.info("Encounter recaptcha")
@@ -125,11 +171,11 @@ async function saveEachPage(page, response, keyword, currentIndex, pageIndex, lo
     }
 }
 
-async function processKeyword(page, keyword, currentIndex){
+async function processKeyword(page, keyword, keywordIndex, pageIndex){
     let startTime = moment();
     let takeScreenshot = process.env.PUPPETEER_TAKE_SCREENSHOT == 'true'
-    const childLogger = logger.child({ keyword: keyword, "current-index": currentIndex });
-    let url = "https://www.google.com/?ql=us&q=" + keyword
+    const childLogger = logger.child({ keyword: keyword, "current-index": keywordIndex });
+    let url = `https://www.google.com/?ql=us&q=${keyword}&start=${pageIndex*10}`
     childLogger.info(`Start request to [${url}]`)
     await page.setUserAgent("Mozilla/5.0 (X11; Linux x86_64; rv:68.0) Gecko/20100101 Firefox/68.0")
     const response = await page.goto(url, {
@@ -139,18 +185,12 @@ async function processKeyword(page, keyword, currentIndex){
     const element = await page.waitForSelector('[name="btnK"]');
     await element.click();
     await page.waitForNavigation()
-
-    try{
-        await saveEachPage(page, response, keyword, currentIndex, 1, childLogger, takeScreenshot)
-        for (var i=2; i<11; i++){
-            const element = await page.waitForSelector(`[aria-label="Page ${i}"]`);
-            await element.click();
-            await page.waitForNavigation()
-            await saveEachPage(page, response, keyword, currentIndex, i, childLogger, takeScreenshot)
-        }
-    } catch (err){
-        throw err
+    if (pageIndex > 0){
+        const element = await page.waitForSelector(`[aria-label="Page ${pageIndex+1}"]`);
+        await element.click();
+        await page.waitForNavigation()
     }
+    await saveSearchResultPage(page, response, keyword, keywordIndex, pageIndex, childLogger, takeScreenshot)
 
     let endTime = moment();
     var secondsDiff = endTime.diff(startTime, 'seconds')

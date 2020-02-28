@@ -63,7 +63,7 @@ async function run (keywordFile) {
             keyword = line.toString();
             try {
                 console.log(await browser.userAgent())
-                await processPage(page, keyword, current);
+                await processKeyword(page, keyword, current);
             } catch(err){   
                 if (err instanceof EncounterRecaptcha){
                     throw err
@@ -85,28 +85,15 @@ async function run (keywordFile) {
     }
 }
 
-async function processPage(page,keyword, currentIndex){
-    let startTime = moment();
-    const childLogger = logger.child({ keyword: keyword, "current-index": currentIndex });
-    let url = "https://www.google.com/?ql=us&q=" + keyword
-    childLogger.info(`Start request to [${url}]`)
-    await page.setUserAgent("Mozilla/5.0 (X11; Linux x86_64; rv:68.0) Gecko/20100101 Firefox/68.0")
-    const response = await page.goto(url, {
-        timeout: 30000,
-        waitUntil: 'networkidle2',
-    });
-    const element = await page.waitForSelector('[name="btnK"]');
-    await element.click();
-    await page.waitForNavigation()
-
-    childLogger.info(`Status code: ${response._status}`);
-    let fileName = `${keyword}_${currentIndex}_${response._status}`
+async function saveEachPage(page, response, keyword, currentIndex, pageIndex, logger, takeScreenshot){
+    let childLogger = logger.child({ pageIndex: pageIndex})
+    let fileName = `${keyword}_${pageIndex}_${currentIndex}_${response._status}`
     let isRepcaptcha = false
     // await page.waitFor(3000);
     try{
         if (await isRecaptchaPage(page)){
             childLogger.info("Encounter recaptcha")
-            fileName = `${keyword}_${currentIndex}_${response._status}_RECAPTCHA`
+            fileName = `${fileName}_RECAPTCHA`
             isRepcaptcha = true
         }
     }catch(err){
@@ -123,21 +110,51 @@ async function processPage(page,keyword, currentIndex){
         childLogger.info('Dump content successfully');
     }); 
 
+    if (takeScreenshot){
+        try{
+            await page.screenshot({path: `screenshot/${fileName}.jpeg`, type:'jpeg', quality: 10, fullPage: true});
+            childLogger.info('Screnshot page successfully');
+        } catch(err){
+            childLogger.error("screenshot failed");
+            throw err
+        }
+    }
+
+    if (isRepcaptcha){
+        throw new EncounterRecaptcha(`${url} is recaptcha`)
+    }
+}
+
+async function processKeyword(page, keyword, currentIndex){
+    let startTime = moment();
+    let takeScreenshot = process.env.PUPPETEER_TAKE_SCREENSHOT == 'true'
+    const childLogger = logger.child({ keyword: keyword, "current-index": currentIndex });
+    let url = "https://www.google.com/?ql=us&q=" + keyword
+    childLogger.info(`Start request to [${url}]`)
+    await page.setUserAgent("Mozilla/5.0 (X11; Linux x86_64; rv:68.0) Gecko/20100101 Firefox/68.0")
+    const response = await page.goto(url, {
+        timeout: 30000,
+        waitUntil: 'networkidle2',
+    });
+    const element = await page.waitForSelector('[name="btnK"]');
+    await element.click();
+    await page.waitForNavigation()
+
     try{
-        await page.screenshot({path: `screenshot/${fileName}.jpeg`, type:'jpeg', quality: 100, fullPage: true});
-        childLogger.info('Screnshot page successfully');
-    } catch(err){
-        childLogger.error("screenshot failed");
+        await saveEachPage(page, response, keyword, currentIndex, 1, childLogger, takeScreenshot)
+        for (var i=2; i<11; i++){
+            const element = await page.waitForSelector(`[aria-label="Page ${i}"]`);
+            await element.click();
+            await page.waitForNavigation()
+            await saveEachPage(page, response, keyword, currentIndex, i, childLogger, takeScreenshot)
+        }
+    } catch (err){
         throw err
     }
 
     let endTime = moment();
     var secondsDiff = endTime.diff(startTime, 'seconds')
     childLogger.info(`Took ${secondsDiff}s`)
-
-    if (isRepcaptcha){
-        throw new EncounterRecaptcha(`${url} is recaptcha`)
-    }
 }
 
 async function isRecaptchaPage(page){
@@ -155,4 +172,5 @@ async function isRecaptchaPage(page){
 }
 
 
-run("/usr/share/dict/words");
+//run("/usr/share/dict/words");
+run(process.argv[2])

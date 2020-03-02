@@ -4,8 +4,17 @@ const lineByLine = require('n-readlines');
 const puppeteer = require('puppeteer-extra') 
 const StealthPlugin = require('puppeteer-extra-plugin-stealth')
 puppeteer.use(StealthPlugin())
+const RecaptchaPlugin = require('puppeteer-extra-plugin-recaptcha')
+puppeteer.use(
+  RecaptchaPlugin({
+    provider: {
+      id: '2captcha',
+      token: '007b5a34b5cd7f080461f333978c90c0' // REPLACE THIS WITH YOUR OWN 2CAPTCHA API KEY ⚡
+    },
+    visualFeedback: true // colorize reCAPTCHAs (violet = detected, green = solved)
+  })
+)
 var moment = require('moment')
-var sleep = require('sleep');
 
 const logger = winston.createLogger({
     level: 'info',
@@ -24,6 +33,7 @@ const Entities = require('html-entities').XmlEntities;
 const entities = new Entities();
 const Queue = require('bull');
 const KeywordQueue = new Queue('keyword');
+
 
 class EncounterRecaptcha extends Error {  
     constructor (message) {
@@ -106,20 +116,20 @@ async function queueConsumer(){
         let {keyword, index, pageIndex} = job.data
         try{
             await processKeyword(page, keyword, index, pageIndex)
-            if (pageIndex < 10){
-                await KeywordQueue.add({
-                    keyword: keyword,
-                    index: index,
-                    pageIndex: pageIndex+1
-                })
-            }
+            // if (pageIndex < 10){
+            //     await KeywordQueue.add({
+            //         keyword: keyword,
+            //         index: index,
+            //         pageIndex: pageIndex+1
+            //     })
+            // }
         }catch(err){
             logger.error(err)
-            await KeywordQueue.add({
-                keyword: keyword,
-                index: index,
-                pageIndex: pageIndex
-            })
+            // await KeywordQueue.add({
+            //     keyword: keyword,
+            //     index: index,
+            //     pageIndex: pageIndex
+            // })
             try{
                 await setup()
             }catch(err){
@@ -146,6 +156,15 @@ async function saveSearchResultPage(page, response, keyword, currentIndex, pageI
         throw err
     }
 
+    if (isRepcaptcha){
+        childLogger.info("Encounter recaptcha page")
+        await page.solveRecaptchas()
+        await Promise.all([
+            page.waitForNavigation()
+        ])
+        childLogger.info("solved recaptcha")
+    }
+
     let html = await page.content();
     let content = entities.decode(html);
     fs.writeFile(`html/${fileName}.html`, content, function (err) {
@@ -165,17 +184,13 @@ async function saveSearchResultPage(page, response, keyword, currentIndex, pageI
             throw err
         }
     }
-
-    if (isRepcaptcha){
-        throw new EncounterRecaptcha(`${url} is recaptcha`)
-    }
 }
 
 async function processKeyword(page, keyword, keywordIndex, pageIndex){
     let startTime = moment();
     let takeScreenshot = process.env.PUPPETEER_TAKE_SCREENSHOT == 'true'
     const childLogger = logger.child({ keyword: keyword, "current-index": keywordIndex });
-    let url = `https://www.google.com/?ql=us&q=${keyword}&start=${pageIndex*10}`
+    let url = `https://www.google.com/?gl=us&q=${keyword}`
     childLogger.info(`Start request to [${url}]`)
     await page.setUserAgent("Mozilla/5.0 (X11; Linux x86_64; rv:68.0) Gecko/20100101 Firefox/68.0")
     const response = await page.goto(url, {
@@ -185,11 +200,29 @@ async function processKeyword(page, keyword, keywordIndex, pageIndex){
     const element = await page.waitForSelector('[name="btnK"]');
     await element.click();
     await page.waitForNavigation()
-    if (pageIndex > 0){
-        const element = await page.waitForSelector(`[aria-label="Page ${pageIndex+1}"]`);
-        await element.click();
-        await page.waitForNavigation()
+    if (await isRecaptchaPage(page)){
+        childLogger.info("Encounter recaptcha page")
+        let html = await page.content();
+        let content = entities.decode(html);
+        fs.writeFile(`html/${keyword}_RECAPTCHA.html`, content, function (err) {
+            if (err) {
+                childLogger.error("save html failed");
+                throw err;
+            }
+            childLogger.info('Dump content successfully');
+        });
+        await page.screenshot({path: `screenshot/${keyword}_RECAPTCHA.jpeg`, type:'jpeg', quality: 100, fullPage: true});
+        await page.solveRecaptchas()
+        await Promise.all([
+            page.waitForNavigation()
+          ])
+          childLogger.info("solved recaptcha")
     }
+    // if (pageIndex > 0){
+    //     const element = await page.waitForSelector(`[aria-label="Page ${pageIndex+1}"]`);
+    //     await element.click();
+    //     await page.waitForNavigation()
+    // }
     await saveSearchResultPage(page, response, keyword, keywordIndex, pageIndex, childLogger, takeScreenshot)
 
     let endTime = moment();

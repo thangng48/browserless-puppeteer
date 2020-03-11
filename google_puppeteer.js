@@ -29,6 +29,29 @@ const logger = winston.createLogger({
     ]
 });
 
+const blockedResourceTypes = [
+    'image',
+    'media',
+    'font',
+    'texttrack',
+    'object',
+    'beacon',
+    'csp_report',
+    'imageset',
+  ];
+  
+const skippedResources = [
+    'gstatic.com',
+    'id.google.com',
+    'adservice.google',
+    'googleusercontent.com',
+    'doubleclick.net',
+    'apis.google.com',
+    'ggpht.com',
+    'ogs.google.com',
+    'play.google.com'
+];
+
 const Entities = require('html-entities').XmlEntities;
 const entities = new Entities();
 const Queue = require('bull');
@@ -77,6 +100,7 @@ async function queueProducer(keywordIterator){
         if (count > 10){
             logger.info(`Number of job: ${count}. Sleep 5s.`)
             await new Promise(resolve => setTimeout(resolve, 5000));
+            continue
         }
         keyword = line.toString()
 
@@ -91,23 +115,26 @@ async function queueProducer(keywordIterator){
 
 async function queueConsumer(){
     let browser = null
-    let page = null
+    //let page = null
+    let proxy = process.env.PUPPETEER_PROXY
+    let websocketUrl = `ws://localhost:3000`
+    if(proxy != ""){
+        websocketUrl = `${websocketUrl}`
+    }
+    logger.info(`web-socket url: ${websocketUrl}`)
 
     const cleanup = () =>{
         if (browser != null && browser.isConnected()){
             browser.close()
         } 
-        if (page != null && page.isClosed()){
-            page.close()
-        }
     }
 
     const setup = async () => {
         cleanup()
         browser = await puppeteer.connect({
-            browserWSEndpoint: `ws://localhost:3000`        
+            browserWSEndpoint: websocketUrl,
+			slowMo: 100
         });
-        page = await browser.newPage();
     }
 
     await setup()
@@ -115,21 +142,14 @@ async function queueConsumer(){
     await KeywordQueue.process(async function(job, done){
         let {keyword, index, pageIndex} = job.data
         try{
-            await processKeyword(page, keyword, index, pageIndex)
-            // if (pageIndex < 10){
-            //     await KeywordQueue.add({
-            //         keyword: keyword,
-            //         index: index,
-            //         pageIndex: pageIndex+1
-            //     })
-            // }
+            await processKeyword(browser, keyword, index, pageIndex)
         }catch(err){
             logger.error(err)
-            // await KeywordQueue.add({
-            //     keyword: keyword,
-            //     index: index,
-            //     pageIndex: pageIndex
-            // })
+            await KeywordQueue.add({
+                keyword: keyword,
+                index: index,
+                pageIndex: 0
+            })
             try{
                 await setup()
             }catch(err){
@@ -186,20 +206,37 @@ async function saveSearchResultPage(page, response, keyword, currentIndex, pageI
     }
 }
 
-async function processKeyword(page, keyword, keywordIndex, pageIndex){
+async function processKeyword(browser, keyword, keywordIndex, pageIndex){
+	page = await browser.newPage();
+        await page.setRequestInterception(true);
+        page.on('request', request => {
+        const requestUrl = request._url.split('?')[0].split('#')[0];
+        if (
+            blockedResourceTypes.indexOf(request.resourceType()) !== -1 ||
+            skippedResources.some(resource => requestUrl.indexOf(resource) !== -1)
+        ) {
+            request.abort();
+        } else {
+            request.continue();
+        }
+        });
+
     let startTime = moment();
     let takeScreenshot = process.env.PUPPETEER_TAKE_SCREENSHOT == 'true'
     const childLogger = logger.child({ keyword: keyword, "current-index": keywordIndex });
-    let url = `https://www.google.com/?gl=us&q=${keyword}`
+    let url = `https://www.google.com/?gl=us&q=${keyword}&num=100`
     childLogger.info(`Start request to [${url}]`)
     await page.setUserAgent("Mozilla/5.0 (X11; Linux x86_64; rv:68.0) Gecko/20100101 Firefox/68.0")
     const response = await page.goto(url, {
-        timeout: 30000,
+        timeout: 180000,
         waitUntil: 'networkidle2',
     });
-    const element = await page.waitForSelector('[name="btnK"]');
-    await element.click();
-    await page.waitForNavigation()
+
+	await page.evaluate(() => {
+  		document.querySelector('[name="btnK"]').click();
+	});
+	await page.waitForNavigation()
+
     if (await isRecaptchaPage(page)){
         childLogger.info("Encounter recaptcha page")
         let html = await page.content();
@@ -218,13 +255,9 @@ async function processKeyword(page, keyword, keywordIndex, pageIndex){
           ])
           childLogger.info("solved recaptcha")
     }
-    // if (pageIndex > 0){
-    //     const element = await page.waitForSelector(`[aria-label="Page ${pageIndex+1}"]`);
-    //     await element.click();
-    //     await page.waitForNavigation()
-    // }
-    await saveSearchResultPage(page, response, keyword, keywordIndex, pageIndex, childLogger, takeScreenshot)
 
+    await saveSearchResultPage(page, response, keyword, keywordIndex, pageIndex, childLogger, takeScreenshot)
+	page.close()
     let endTime = moment();
     var secondsDiff = endTime.diff(startTime, 'seconds')
     childLogger.info(`Took ${secondsDiff}s`)
